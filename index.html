@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>배지 싱크 실험</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #111; color: #eee; max-width: 520px; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  section { background: #1c1c22; border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+  h2 { font-size: 15px; margin: 0 0 8px; color: #9ab; }
+  button { font-size: 16px; padding: 10px 14px; border-radius: 10px; border: 0; background: #3d7bff; color: #fff; margin: 4px 4px 4px 0; }
+  button:disabled { background: #444; color: #888; }
+  button.sec { background: #333; }
+  select, input[type=file] { font-size: 15px; width: 100%; margin: 4px 0; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .big { font-size: 22px; font-variant-numeric: tabular-nums; }
+  .muted { color: #999; font-size: 13px; }
+  input[type=range] { width: 100%; }
+  pre { white-space: pre-wrap; font-size: 12px; background: #0b0b0e; padding: 8px; border-radius: 8px; max-height: 220px; overflow: auto; }
+  .ok { color: #6d6; } .bad { color: #f77; }
+</style>
+</head>
+<body>
+<h1>배지 싱크 실험 (폰 소리 + 기기 영상)</h1>
+
+<section>
+  <h2>1. 기기 연결</h2>
+  <button id="bConn">BADGE-DEMO 연결</button>
+  <span id="connState" class="muted">연결 안 됨</span>
+  <div id="noBt" class="bad" hidden>이 브라우저는 Web Bluetooth를 지원하지 않습니다. 안드로이드 Chrome에서 열어 주세요.</div>
+</section>
+
+<section>
+  <h2>2. 음원과 영상 번호</h2>
+  <input type="file" id="file" accept="audio/*,.ogg,.m4a">
+  <select id="item">
+    <option value="0">01 Stray Kids - This and That</option>
+    <option value="1">02 NCT DREAM - Boogie Woogie</option>
+    <option value="2">03 RIIZE - Insomnia</option>
+  </select>
+  <div id="fileState" class="muted">음원 파일을 고르세요 (sync_01… 파일과 영상 번호를 맞춤)</div>
+</section>
+
+<section>
+  <h2>3. 재생</h2>
+  <div class="row">
+    <button id="bPlay" disabled>재생</button>
+    <button id="bPause" class="sec" disabled>일시정지</button>
+    <button id="bStop" class="sec" disabled>정지</button>
+    <button id="bBack" class="sec" disabled>-10초</button>
+    <button id="bFwd" class="sec" disabled>+10초</button>
+  </div>
+  <div class="big" id="pos">0.00 s</div>
+  <div class="muted" id="lat">출력 지연: -</div>
+</section>
+
+<section>
+  <h2>4. 지연 보정</h2>
+  <div class="row"><span>출력 장치</span>
+    <select id="out" style="width:auto">
+      <option value="spk">폰 스피커</option>
+      <option value="bt">블루투스 이어폰</option>
+      <option value="wired">유선 이어폰</option>
+    </select>
+  </div>
+  <div>추가 보정: <b id="offV">0</b> ms <span class="muted">(+ = 영상을 늦춤, - = 영상을 당김)</span></div>
+  <input type="range" id="off" min="-500" max="500" step="10" value="0">
+  <div class="row">
+    <button class="sec" data-d="-50">-50</button><button class="sec" data-d="-10">-10</button>
+    <button class="sec" data-d="10">+10</button><button class="sec" data-d="50">+50</button>
+    <button class="sec" id="bMark">이 값이 맞음 (기록)</button>
+  </div>
+</section>
+
+<section>
+  <h2>5. 기기 상태</h2>
+  <div id="dev" class="muted">-</div>
+</section>
+
+<section>
+  <h2>기록</h2>
+  <button class="sec" id="bCopy">기록 복사</button>
+  <pre id="log"></pre>
+</section>
+
+<script>
+const SVC = 0xFFF0, CH_STATUS = 0xFFF1, CH_SYNC = 0xFFF2;
+let dev, chSync, ctx, buf, src, startCtx = 0, startPos = 0, playing = false, timer = null, seq = 0;
+let sendFail = 0, sendOk = 0;
+const $ = id => document.getElementById(id);
+const logLines = [];
+function log(s) {
+  const t = new Date().toTimeString().slice(0, 8);
+  logLines.push(t + ' ' + s);
+  $('log').textContent = logLines.slice(-200).join('\n');
+  $('log').scrollTop = 1e9;
+}
+if (!navigator.bluetooth) { $('noBt').hidden = false; $('bConn').disabled = true; }
+
+$('bConn').onclick = async () => {
+  try {
+    dev = await navigator.bluetooth.requestDevice({ filters: [{ name: 'BADGE-DEMO' }], optionalServices: [SVC] });
+    dev.addEventListener('gattserverdisconnected', () => { $('connState').textContent = '연결 끊김'; $('connState').className = 'bad'; log('BLE 연결 끊김'); chSync = null; });
+    const gatt = await dev.gatt.connect();
+    const svc = await gatt.getPrimaryService(SVC);
+    chSync = await svc.getCharacteristic(CH_SYNC);
+    const st = await svc.getCharacteristic(CH_STATUS);
+    st.addEventListener('characteristicvaluechanged', ev => {
+      const v = ev.target.value;
+      const state = v.getUint8(0), item = v.getUint8(1), frame = v.getUint16(2, true), err = v.getInt16(4, true), drops = v.getUint16(6, true);
+      $('dev').textContent = `상태 ${['대기', '재생', '멈춤'][state] || state} · 영상 ${item + 1} · 프레임 ${frame} (${(frame / 24).toFixed(2)} s) · 위치 오차 ${err} ms · 버린 프레임 ${drops}`;
+      lastDev = { state, frame, err, drops };
+    });
+    await st.startNotifications();
+    $('connState').textContent = '연결됨'; $('connState').className = 'ok';
+    log('BLE 연결됨');
+    updateButtons();
+  } catch (e) { log('연결 실패: ' + (e && e.message)); }
+};
+let lastDev = null;
+
+$('file').onchange = async () => {
+  const f = $('file').files[0];
+  if (!f) return;
+  $('fileState').textContent = '불러오는 중…';
+  try {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'playback' });
+    buf = await ctx.decodeAudioData(await f.arrayBuffer());
+    $('fileState').textContent = `${f.name} · ${buf.duration.toFixed(1)} s`;
+    const m = f.name.match(/(\d\d)_/);
+    if (m && +m[1] >= 1 && +m[1] <= 3) $('item').value = String(+m[1] - 1);
+    log('음원: ' + f.name + ' ' + buf.duration.toFixed(1) + 's');
+    updateButtons();
+  } catch (e) { $('fileState').textContent = '열기 실패: ' + (e && e.message); }
+};
+
+function updateButtons() {
+  const ready = !!buf;
+  $('bPlay').disabled = !ready || playing;
+  $('bPause').disabled = !playing;
+  $('bStop').disabled = !ready;
+  $('bBack').disabled = $('bFwd').disabled = !ready;
+}
+
+/* 지금 실제로 들리는 위치(초). getOutputTimestamp가 있으면 출력 시점 기준 */
+function heardPos() {
+  if (!playing) return startPos;
+  let t = ctx.currentTime;
+  if (ctx.getOutputTimestamp) {
+    const ts = ctx.getOutputTimestamp();
+    if (ts.contextTime > 0) t = ts.contextTime + (performance.now() - ts.performanceTime) / 1000;
+  } else if (ctx.outputLatency) t -= ctx.outputLatency;
+  return startPos + (t - startCtx);
+}
+function videoPos() { return heardPos() - (+$('off').value) / 1000; }
+
+async function send(cmd, posSec) {
+  if (!chSync) return;
+  const b = new DataView(new ArrayBuffer(6));
+  b.setUint8(0, cmd); b.setUint8(1, +$('item').value);
+  b.setUint32(2, Math.max(0, Math.round(posSec * 1000)), true);
+  try {
+    if (chSync.writeValueWithoutResponse) await chSync.writeValueWithoutResponse(b.buffer);
+    else await chSync.writeValue(b.buffer);
+    sendOk++;
+  } catch (e) { sendFail++; }
+}
+
+function startAt(pos) {
+  if (src) { try { src.stop(); } catch (e) {} }
+  src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  const when = ctx.currentTime + 0.05;
+  src.start(when, pos);
+  startCtx = when; startPos = pos; playing = true;
+  src.onended = () => { if (playing && heardPos() >= buf.duration - 0.2) { playing = false; send(3, 0); log('끝'); updateButtons(); } };
+}
+
+$('bPlay').onclick = async () => {
+  await ctx.resume();
+  startAt(startPos);
+  send(1, Math.max(0, videoPos()));
+  if (!timer) timer = setInterval(tick, 100);
+  log(`재생 ${startPos.toFixed(2)}s · 영상 ${+$('item').value + 1} · 출력 ${$('out').selectedOptions[0].text}`);
+  updateButtons();
+};
+$('bPause').onclick = () => {
+  startPos = heardPos(); playing = false;
+  try { src.stop(); } catch (e) {}
+  send(4, Math.max(0, videoPos()));
+  log('일시정지 ' + startPos.toFixed(2) + 's');
+  updateButtons();
+};
+$('bStop').onclick = () => {
+  playing = false; startPos = 0;
+  try { src && src.stop(); } catch (e) {}
+  send(3, 0);
+  log('정지');
+  updateButtons();
+};
+function jump(d) {
+  const p = Math.min(Math.max(0, heardPos() + d), buf.duration - 1);
+  if (playing) { startAt(p); send(2, Math.max(0, videoPos())); } else startPos = p;
+  log((d > 0 ? '+' : '') + d + '초 → ' + p.toFixed(1) + 's');
+}
+$('bBack').onclick = () => jump(-10);
+$('bFwd').onclick = () => jump(10);
+
+function tick() {
+  const p = heardPos();
+  $('pos').textContent = p.toFixed(2) + ' s';
+  const ol = ctx && ctx.outputLatency ? (ctx.outputLatency * 1000).toFixed(0) : '?';
+  const bl = ctx && ctx.baseLatency ? (ctx.baseLatency * 1000).toFixed(0) : '?';
+  $('lat').textContent = `출력 지연(브라우저 보고): output ${ol} ms · base ${bl} ms · 전송 ${sendOk} / 실패 ${sendFail}`;
+  if (playing) send(2, Math.max(0, videoPos()));
+}
+
+const offEl = $('off');
+offEl.oninput = () => { $('offV').textContent = offEl.value; };
+document.querySelectorAll('button[data-d]').forEach(b => b.onclick = () => {
+  offEl.value = Math.max(-500, Math.min(500, +offEl.value + +b.dataset.d)); offEl.oninput();
+});
+$('bMark').onclick = () => {
+  const ol = ctx && ctx.outputLatency ? (ctx.outputLatency * 1000).toFixed(0) : '?';
+  log(`★ 맞는 보정값: ${offEl.value} ms · 출력 ${$('out').selectedOptions[0].text} · 브라우저 출력지연 ${ol} ms` + (lastDev ? ` · 기기 오차 ${lastDev.err} ms, 버린 프레임 ${lastDev.drops}` : ''));
+};
+$('out').onchange = () => log('출력 장치: ' + $('out').selectedOptions[0].text);
+$('bCopy').onclick = async () => {
+  try { await navigator.clipboard.writeText(logLines.join('\n')); $('bCopy').textContent = '복사됨'; }
+  catch (e) { $('bCopy').textContent = '복사 실패'; }
+  setTimeout(() => $('bCopy').textContent = '기록 복사', 1500);
+};
+</script>
+</body>
+</html>
