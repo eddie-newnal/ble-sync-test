@@ -151,6 +151,7 @@ $('bConn').onclick = async () => {
         ? `${names[3]} · 영상 ${item + 1} · 프레임 ${frame} (${(frame / 24).toFixed(2)} s)`
         : `상태 ${names[state] || state} · 영상 ${item + 1} · 프레임 ${frame} (${(frame / 24).toFixed(2)} s) · 위치 오차 ${err} ms · 버린 프레임 ${drops}`;
       lastDev = { state, item, frame, err, drops };
+      if (state === 3 && giveSrc) endGive(`기기 소리 시작 확인 · 요청 후 ${(performance.now() - t_give).toFixed(0)} ms 동안 폰도 재생`);
       if (!playing) $('route').textContent = state === 3 ? '소리: 기기' : '소리: -';
       updateButtons();
     });
@@ -161,6 +162,14 @@ $('bConn').onclick = async () => {
   } catch (e) { log('연결 실패: ' + errText(e)); }
 };
 let lastDev = null, takeWait = false;
+const OVERLAP_UNTIL_DEVICE = false;   /* true: 기기 소리가 날 때까지 폰도 재생 (기기 시작 위치가 약 0.9초 늦어 보류) */
+let giveSrc = null, t_give = 0;   /* 폰 → 기기: 기기 소리가 날 때까지 폰도 계속 재생 */
+function endGive(msg) {
+  if (!giveSrc) return;
+  try { giveSrc.stop(); } catch (e) {}
+  giveSrc = null;
+  log(msg);
+}
 const bufs = {};   /* 영상 번호 → 음원 */
 
 $('file').onchange = async () => {
@@ -250,6 +259,7 @@ $('bTake').onclick = async () => {
 };
 let t_take = 0;
 function beginFromDevice(item, posSec) {
+  endGive('넘겨받기 → 이전 폰 소리 정리');
   $('item').value = String(item);
   buf = bufs[item];
   startAt(posSec);
@@ -261,10 +271,14 @@ function beginFromDevice(item, posSec) {
 $('bGive').onclick = () => {
   if (!playing) return;
   const p = heardPos();
-  playing = false;
-  const s0 = src; src = null;
-  try { s0 && s0.stop(); } catch (e) {}
+  playing = false;   /* 위치 전송은 멈춤 (기기가 다시 싱크 모드로 들어가지 않게) */
+  endGive('이전 전환 정리');
+  giveSrc = src; src = null;   /* 소리는 기기 소리가 시작될 때까지 계속 */
+  t_give = performance.now();
   send(6, Math.max(0, p));
+  if (!OVERLAP_UNTIL_DEVICE) { endGive('폰 소리 바로 멈춤'); startPos = 0; $('route').textContent = '소리: 기기'; log(`폰 → 기기 전환: ${p.toFixed(2)} s`); updateButtons(); return; }
+  const g = giveSrc;
+  setTimeout(() => { if (giveSrc === g) endGive('기기 소리 시작 알림 없음 → 3초 후 폰 소리 멈춤'); }, 3000);
   startPos = 0;
   $('route').textContent = '소리: 기기';
   log(`폰 → 기기 전환: ${p.toFixed(2)} s`);
@@ -273,6 +287,7 @@ $('bGive').onclick = () => {
 
 $('bPlay').onclick = async () => {
   await ctx.resume();
+  endGive('재생 버튼 → 넘겨주던 폰 소리 멈춤');
   startAt(startPos);
   send(1, Math.max(0, videoPos()));
   if (!timer) timer = setInterval(tick, 100);
@@ -288,6 +303,7 @@ $('bPause').onclick = () => {
   updateButtons();
 };
 $('bStop').onclick = () => {
+  endGive('정지 → 넘겨주던 폰 소리 멈춤');
   playing = false; startPos = 0;
   const s0 = src; src = null;
   try { s0 && s0.stop(); } catch (e) {}

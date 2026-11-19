@@ -24,3 +24,7 @@ Web Bluetooth는 HTTPS에서만 동작하므로 GitHub Pages로 공개한다.
 
 ## 반복 작업: 수정본 올리기 ("페이지 갱신해줘")
 `git add index.html && git commit -m "<요약>" && git push` → 1~2분 뒤 반영.
+
+Eddie는 새 버전을 `index_new.html`, `index_v3.html`, `index_v4.html`처럼 **별도 파일로 두는 경우가 많다**. `index.html`에 변경이 없으면:
+1. 가장 최근 `index_*.html`을 찾고, 이전 버전(현재 `index.html` 포함)의 수정 내용을 빠짐없이 담고 있는지 `diff`로 확인한다.
+2. 문제가 없으면 그 파일로 `index.html`을 교체한 뒤 위 명령으로 올린다. 어느 파일인지 애매하면 Eddie에게 묻는다.
