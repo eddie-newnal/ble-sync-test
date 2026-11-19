@@ -169,14 +169,19 @@ async function send(cmd, posSec) {
 }
 
 function startAt(pos) {
-  if (src) { try { src.stop(); } catch (e) {} }
+  const old = src;
   src = ctx.createBufferSource();
+  if (old) { try { old.stop(); } catch (e) {} }
   src.buffer = buf;
   src.connect(ctx.destination);
   const when = ctx.currentTime + 0.05;
   src.start(when, pos);
   startCtx = when; startPos = pos; playing = true;
-  src.onended = () => { if (playing && heardPos() >= buf.duration - 0.2) { playing = false; send(3, 0); log('끝'); updateButtons(); } };
+  const me = src;
+  src.onended = () => {   /* 사용자가 멈춘 경우가 아니라 음원이 끝까지 재생된 경우 */
+    if (me !== src || !playing) return;
+    playing = false; startPos = 0; send(3, 0); log('끝'); updateButtons();
+  };
 }
 
 $('bPlay').onclick = async () => {
@@ -189,21 +194,24 @@ $('bPlay').onclick = async () => {
 };
 $('bPause').onclick = () => {
   startPos = heardPos(); playing = false;
-  try { src.stop(); } catch (e) {}
+  const s0 = src; src = null;
+  try { s0.stop(); } catch (e) {}
   send(4, Math.max(0, videoPos()));
   log('일시정지 ' + startPos.toFixed(2) + 's');
   updateButtons();
 };
 $('bStop').onclick = () => {
   playing = false; startPos = 0;
-  try { src && src.stop(); } catch (e) {}
+  const s0 = src; src = null;
+  try { s0 && s0.stop(); } catch (e) {}
   send(3, 0);
   log('정지');
   updateButtons();
 };
 function jump(d) {
   const p = Math.min(Math.max(0, heardPos() + d), buf.duration - 1);
-  if (playing) { startAt(p); send(2, Math.max(0, videoPos())); } else startPos = p;
+  if (playing) { startAt(p); send(2, Math.max(0, videoPos())); }
+  else { startPos = p; send(4, Math.max(0, p - (+$('off').value) / 1000)); }   /* 멈춘 상태에서도 기기 화면을 그 위치로 */
   log((d > 0 ? '+' : '') + d + '초 → ' + p.toFixed(1) + 's');
 }
 $('bBack').onclick = () => jump(-10);
