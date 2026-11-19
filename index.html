@@ -34,13 +34,13 @@
 
 <section>
   <h2>2. 음원과 영상 번호</h2>
-  <input type="file" id="file" accept="audio/*,.ogg,.m4a">
+  <input type="file" id="file" accept="audio/*,.ogg,.m4a" multiple>
   <select id="item">
     <option value="0">01 Stray Kids - This and That</option>
     <option value="1">02 NCT DREAM - Boogie Woogie</option>
     <option value="2">03 RIIZE - Insomnia</option>
   </select>
-  <div id="fileState" class="muted">음원 파일을 고르세요 (sync_01… 파일과 영상 번호를 맞춤)</div>
+  <div id="fileState" class="muted">음원 파일을 고르세요. 여러 개를 한 번에 골라 두면 소리 전환 때 기기가 재생 중인 영상의 음원을 자동으로 씁니다 (파일 이름 sync_01…로 영상 번호를 맞춤)</div>
 </section>
 
 <section>
@@ -54,6 +54,16 @@
   </div>
   <div class="big" id="pos">0.00 s</div>
   <div class="muted" id="lat">출력 지연: -</div>
+</section>
+
+<section>
+  <h2>소리 전환</h2>
+  <div class="row">
+    <button id="bTake" class="sec" disabled>폰으로 듣기</button>
+    <button id="bGive" class="sec" disabled>기기로 듣기</button>
+  </div>
+  <div id="route" class="big">소리: -</div>
+  <div class="muted">기기에서 영상을 재생 중일 때 "폰으로 듣기" → 같은 위치부터 폰(이어폰)으로 소리, 기기는 영상만. "기기로 듣기" → 그 위치부터 기기 스피커로</div>
 </section>
 
 <section>
@@ -90,6 +100,7 @@ const SVC = 0xFFF0, CH_STATUS = 0xFFF1, CH_SYNC = 0xFFF2;
 let dev, chSync, ctx, buf, src, startCtx = 0, startPos = 0, playing = false, timer = null, seq = 0;
 let sendFail = 0, sendOk = 0;
 const $ = id => document.getElementById(id);
+function errText(e) { if (!e) return '알 수 없음'; return [e.name, e.message, e.code, String(e)].filter(x => x !== undefined && x !== '').join(' / '); }
 const logLines = [];
 function log(s) {
   const t = new Date().toTimeString().slice(0, 8);
@@ -101,43 +112,85 @@ if (!navigator.bluetooth) { $('noBt').hidden = false; $('bConn').disabled = true
 
 $('bConn').onclick = async () => {
   try {
-    dev = await navigator.bluetooth.requestDevice({ filters: [{ name: 'BADGE-DEMO' }], optionalServices: [SVC] });
+    const SVC_FULL = '0000fff0-0000-1000-8000-00805f9b34fb';
+    /* Bluefy(iOS) 호환: 이름 필터가 실패하면 전체 목록에서 고르게 하고, UUID는 128비트 문자열로 */
+    const tries = [
+      { filters: [{ name: 'BADGE-DEMO' }], optionalServices: [SVC_FULL] },
+      { filters: [{ namePrefix: 'BADGE' }], optionalServices: [SVC_FULL] },
+      { acceptAllDevices: true, optionalServices: [SVC_FULL] },
+    ];
+    let lastErr = null;
+    for (const opt of tries) {
+      try { dev = await navigator.bluetooth.requestDevice(opt); break; }
+      catch (e) {
+        lastErr = e;
+        log('기기 선택 실패 (' + Object.keys(opt)[0] + '): ' + errText(e));
+        if (e && e.name === 'NotFoundError' && /cancel/i.test(e.message || '')) throw e;   /* 사용자가 취소 */
+      }
+    }
+    if (!dev) throw lastErr;
     dev.addEventListener('gattserverdisconnected', () => { $('connState').textContent = '연결 끊김'; $('connState').className = 'bad'; log('BLE 연결 끊김'); chSync = null; });
     const gatt = await dev.gatt.connect();
-    const svc = await gatt.getPrimaryService(SVC);
-    chSync = await svc.getCharacteristic(CH_SYNC);
-    const st = await svc.getCharacteristic(CH_STATUS);
+    const svc = await gatt.getPrimaryService(SVC_FULL);
+    chSync = await svc.getCharacteristic('0000fff2-0000-1000-8000-00805f9b34fb');
+    const st = await svc.getCharacteristic('0000fff1-0000-1000-8000-00805f9b34fb');
     st.addEventListener('characteristicvaluechanged', ev => {
       const v = ev.target.value;
-      const state = v.getUint8(0), item = v.getUint8(1), frame = v.getUint16(2, true), err = v.getInt16(4, true), drops = v.getUint16(6, true);
-      $('dev').textContent = `상태 ${['대기', '재생', '멈춤'][state] || state} · 영상 ${item + 1} · 프레임 ${frame} (${(frame / 24).toFixed(2)} s) · 위치 오차 ${err} ms · 버린 프레임 ${drops}`;
-      lastDev = { state, frame, err, drops };
+      const state = v.getUint8(0), item = v.getUint8(1);
+      if (state === 4) {   /* 기기가 소리를 넘겨줌: 이 위치부터 폰에서 재생 */
+        const pos = v.getUint32(2, true);
+        $('dev').textContent = `넘겨받는 중 · 영상 ${item + 1} · 위치 ${(pos / 1000).toFixed(2)} s`;
+        if (takeWait) { takeWait = false; beginFromDevice(item, pos / 1000); }
+        lastDev = { state, item, frame: Math.round(pos / 1000 * 24), err: 0, drops: 0 };
+        updateButtons();
+        return;
+      }
+      const frame = v.getUint16(2, true), err = v.getInt16(4, true), drops = v.getUint16(6, true);
+      const names = ['대기', '폰 소리로 재생', '멈춤', '기기 소리로 재생'];
+      $('dev').textContent = state === 3
+        ? `${names[3]} · 영상 ${item + 1} · 프레임 ${frame} (${(frame / 24).toFixed(2)} s)`
+        : `상태 ${names[state] || state} · 영상 ${item + 1} · 프레임 ${frame} (${(frame / 24).toFixed(2)} s) · 위치 오차 ${err} ms · 버린 프레임 ${drops}`;
+      lastDev = { state, item, frame, err, drops };
+      if (!playing) $('route').textContent = state === 3 ? '소리: 기기' : '소리: -';
+      updateButtons();
     });
     await st.startNotifications();
     $('connState').textContent = '연결됨'; $('connState').className = 'ok';
     log('BLE 연결됨');
     updateButtons();
-  } catch (e) { log('연결 실패: ' + (e && e.message)); }
+  } catch (e) { log('연결 실패: ' + errText(e)); }
 };
-let lastDev = null;
+let lastDev = null, takeWait = false;
+const bufs = {};   /* 영상 번호 → 음원 */
 
 $('file').onchange = async () => {
-  const f = $('file').files[0];
-  if (!f) return;
+  const files = [...$('file').files];
+  if (!files.length) return;
   $('fileState').textContent = '불러오는 중…';
-  try {
-    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'playback' });
-    buf = await ctx.decodeAudioData(await f.arrayBuffer());
-    $('fileState').textContent = `${f.name} · ${buf.duration.toFixed(1)} s`;
-    const m = f.name.match(/(\d\d)_/);
-    if (m && +m[1] >= 1 && +m[1] <= 3) $('item').value = String(+m[1] - 1);
-    log('음원: ' + f.name + ' ' + buf.duration.toFixed(1) + 's');
-    updateButtons();
-  } catch (e) { $('fileState').textContent = '열기 실패: ' + (e && e.message); }
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'playback' });
+  const names = [];
+  for (const f of files) {
+    try {
+      const b = await ctx.decodeAudioData(await f.arrayBuffer());
+      const m = f.name.match(/(\d\d)_/);
+      const it = m ? +m[1] - 1 : +$('item').value;
+      bufs[it] = b;
+      names.push(`영상 ${it + 1}: ${f.name} (${b.duration.toFixed(1)} s)`);
+      log('음원: ' + f.name + ' → 영상 ' + (it + 1));
+      if (files.length === 1 || it === +$('item').value) $('item').value = String(it);
+    } catch (e) { names.push(f.name + ' 열기 실패'); }
+  }
+  buf = bufs[+$('item').value] || null;
+  $('fileState').textContent = names.join(' · ');
+  updateButtons();
 };
+$('item').onchange = () => { buf = bufs[+$('item').value] || null; updateButtons(); };
 
 function updateButtons() {
   const ready = !!buf;
+  $('bTake').disabled = playing || !chSync || !lastDev || lastDev.state !== 3 || !bufs[lastDev.item];
+  $('bGive').disabled = !playing || !chSync;
+  if (playing) $('route').textContent = '소리: 폰';
   $('bPlay').disabled = !ready || playing;
   $('bPause').disabled = !playing;
   $('bStop').disabled = !ready;
@@ -183,6 +236,40 @@ function startAt(pos) {
     playing = false; startPos = 0; send(3, 0); log('끝'); updateButtons();
   };
 }
+
+/* 기기 → 폰 */
+$('bTake').onclick = async () => {
+  if (!lastDev || lastDev.state !== 3) { log('기기가 소리를 내며 재생 중이 아닙니다'); return; }
+  if (!bufs[lastDev.item]) { log(`영상 ${lastDev.item + 1}의 음원 파일을 먼저 고르세요`); return; }
+  await ctx.resume();   /* 소리 재생 허용은 버튼을 누를 때 받아 둠 */
+  takeWait = true;
+  t_take = performance.now();
+  send(5, 0);
+  log('폰으로 듣기 요청');
+  setTimeout(() => { if (takeWait) { takeWait = false; log('기기 응답 없음 (기기 소리 재생 중인지 확인)'); updateButtons(); } }, 2000);
+};
+let t_take = 0;
+function beginFromDevice(item, posSec) {
+  $('item').value = String(item);
+  buf = bufs[item];
+  startAt(posSec);
+  if (!timer) timer = setInterval(tick, 100);
+  log(`기기 → 폰 전환: 영상 ${item + 1} · ${posSec.toFixed(2)} s · 응답 ${(performance.now() - t_take).toFixed(0)} ms`);
+  updateButtons();
+}
+/* 폰 → 기기 */
+$('bGive').onclick = () => {
+  if (!playing) return;
+  const p = heardPos();
+  playing = false;
+  const s0 = src; src = null;
+  try { s0 && s0.stop(); } catch (e) {}
+  send(6, Math.max(0, p));
+  startPos = 0;
+  $('route').textContent = '소리: 기기';
+  log(`폰 → 기기 전환: ${p.toFixed(2)} s`);
+  updateButtons();
+};
 
 $('bPlay').onclick = async () => {
   await ctx.resume();
