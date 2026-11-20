@@ -129,7 +129,7 @@ $('bConn').onclick = async () => {
       }
     }
     if (!dev) throw lastErr;
-    dev.addEventListener('gattserverdisconnected', () => { $('connState').textContent = '연결 끊김'; $('connState').className = 'bad'; log('BLE 연결 끊김'); chSync = null; });
+    if (!dev._hooked) dev._hooked = true, dev.addEventListener('gattserverdisconnected', () => { $('connState').textContent = '연결 끊김'; $('connState').className = 'bad'; log('BLE 연결 끊김'); chSync = null; });
     const gatt = await dev.gatt.connect();
     const svc = await gatt.getPrimaryService(SVC_FULL);
     chSync = await svc.getCharacteristic('0000fff2-0000-1000-8000-00805f9b34fb');
