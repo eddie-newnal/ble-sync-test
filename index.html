@@ -90,6 +90,18 @@
 </section>
 
 <section>
+  <h2>6. BLE 전송 속도 시험</h2>
+  <div class="row">
+    <select id="xSize" style="width:auto"><option value="1">1 MB</option><option value="4" selected>4 MB</option><option value="13">13 MB</option></select>
+    <select id="xItvl" style="width:auto"><option value="8">7.5 ms</option><option value="15" selected>15 ms</option><option value="30">30 ms</option><option value="50">50 ms</option></select>
+    <label class="muted"><input type="checkbox" id="xTf" checked> 기기 TF 기록</label>
+  </div>
+  <button id="xGo" disabled>전송 시작</button>
+  <progress id="xProg" value="0" max="1" style="width:100%"></progress>
+  <div id="xRes" class="muted">-</div>
+</section>
+
+<section>
   <h2>기록</h2>
   <button class="sec" id="bCopy">기록 복사</button>
   <pre id="log"></pre>
@@ -113,11 +125,12 @@ if (!navigator.bluetooth) { $('noBt').hidden = false; $('bConn').disabled = true
 $('bConn').onclick = async () => {
   try {
     const SVC_FULL = '0000fff0-0000-1000-8000-00805f9b34fb';
+    const XSVC = '0000ffe0-0000-1000-8000-00805f9b34fb';
     /* Bluefy(iOS) 호환: 이름 필터가 실패하면 전체 목록에서 고르게 하고, UUID는 128비트 문자열로 */
     const tries = [
-      { filters: [{ name: 'BADGE-DEMO' }], optionalServices: [SVC_FULL] },
-      { filters: [{ namePrefix: 'BADGE' }], optionalServices: [SVC_FULL] },
-      { acceptAllDevices: true, optionalServices: [SVC_FULL] },
+      { filters: [{ name: 'BADGE-DEMO' }], optionalServices: [SVC_FULL, XSVC] },
+      { filters: [{ namePrefix: 'BADGE' }], optionalServices: [SVC_FULL, XSVC] },
+      { acceptAllDevices: true, optionalServices: [SVC_FULL, XSVC] },
     ];
     let lastErr = null;
     for (const opt of tries) {
@@ -132,6 +145,7 @@ $('bConn').onclick = async () => {
     if (!dev._hooked) dev._hooked = true, dev.addEventListener('gattserverdisconnected', () => { $('connState').textContent = '연결 끊김'; $('connState').className = 'bad'; log('BLE 연결 끊김'); chSync = null; });
     const gatt = await dev.gatt.connect();
     const svc = await gatt.getPrimaryService(SVC_FULL);
+    xferSetup(gatt).catch(e => log('전송 시험 서비스 없음 (xfer1 펌웨어 필요): ' + errText(e)));
     chSync = await svc.getCharacteristic('0000fff2-0000-1000-8000-00805f9b34fb');
     const st = await svc.getCharacteristic('0000fff1-0000-1000-8000-00805f9b34fb');
     st.addEventListener('characteristicvaluechanged', ev => {
@@ -343,6 +357,69 @@ $('bCopy').onclick = async () => {
   try { await navigator.clipboard.writeText(logLines.join('\n')); $('bCopy').textContent = '복사됨'; }
   catch (e) { $('bCopy').textContent = '복사 실패'; }
   setTimeout(() => $('bCopy').textContent = '기록 복사', 1500);
+};
+
+/* ---------- BLE 전송 속도 시험 (서비스 FFE0, xfer1 펌웨어) ---------- */
+let xCtrl = null, xData = null, xStat = null, xWait = null, xLink = '';
+const XU = n => `0000${n.toString(16)}-0000-1000-8000-00805f9b34fb`;
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crcUpd(crc, b) { let c = (crc ^ 0xFFFFFFFF) >>> 0; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+async function xferSetup(gatt) {
+  const s = await gatt.getPrimaryService(XU(0xffe0));
+  xCtrl = await s.getCharacteristic(XU(0xffe1));
+  xData = await s.getCharacteristic(XU(0xffe2));
+  xStat = await s.getCharacteristic(XU(0xffe3));
+  await xStat.startNotifications();
+  xStat.addEventListener('characteristicvaluechanged', ev => {
+    let o; try { o = JSON.parse(new TextDecoder().decode(ev.target.value)); } catch { return; }
+    if (xWait) { const f = xWait; xWait = null; f(o); }
+  });
+  $('xGo').disabled = false;
+  log('전송 시험 서비스 있음');
+}
+const xCmd = b => xCtrl.writeValueWithResponse(new Uint8Array(b));
+const xSleep = ms => new Promise(r => setTimeout(r, ms));
+$('xGo').onclick = async () => {
+  if (!xCtrl) return;
+  $('xGo').disabled = true;
+  const size = Math.round(+$('xSize').value * 1048576), itvl = +$('xItvl').value, tf = $('xTf').checked;
+  try {
+    await xCmd([0x43]);
+    await xCmd([0x50, itvl & 255, itvl >> 8]);
+    await xSleep(1500);
+    const lk = JSON.parse(new TextDecoder().decode(await xStat.readValue()));
+    xLink = `MTU ${lk.mtu} · 간격 ${lk.itvl} ms · PHY ${lk.phy}`;
+    log('연결 정보: ' + xLink);
+    const chunk = Math.max(20, Math.min((lk.mtu || 23) - 3, 512));
+    const sz = new DataView(new ArrayBuffer(4)); sz.setUint32(0, size, true);
+    await xCmd([0x53, tf ? 1 : 0, ...new Uint8Array(sz.buffer)]);
+    await xSleep(300);
+    log(`전송 시작: ${(size / 1048576).toFixed(1)} MB · 청크 ${chunk} B · ${tf ? 'TF 기록' : '버림'} · 간격 요청 ${itvl} ms`);
+    const block = new Uint8Array(65536); crypto.getRandomValues(block);
+    let crc = 0, sent = 0, retries = 0;
+    const t0 = performance.now();
+    while (sent < size) {
+      const off = sent % block.length;
+      const n = Math.min(chunk, size - sent, block.length - off);
+      const b = block.subarray(off, off + n);
+      for (let a = 1; ; a++) {
+        try { await xData.writeValueWithoutResponse(b); break; }
+        catch (e) { retries++; if (!dev.gatt.connected || a >= 20) throw e; await xSleep(20 * a); }
+      }
+      crc = crcUpd(crc, b); sent += n;
+      if ((sent & 0xFFFF) < n) $('xProg').value = sent / size;
+    }
+    const sec = (performance.now() - t0) / 1000;
+    $('xProg').value = 1;
+    const res = new Promise((ok, ng) => { xWait = ok; setTimeout(() => ng(new Error('기기 결과 없음 (10초)')), 10000); });
+    await xCmd([0x45]);
+    const o = await res;
+    const crcOk = o.crc === crc.toString(16).padStart(8, '0');
+    const txt = `${(size / 1048576).toFixed(1)} MB · 페이지 ${(size / 1000 / sec).toFixed(1)} kB/s · 기기 ${o.kBps} kB/s · ${o.bytes === size && crcOk ? 'CRC 일치' : `불일치 (${o.bytes}/${size} B)`} · 청크 ${chunk} B · ${xLink}${o.drop ? ' · TF 누락 ' + o.drop + ' B' : ''}${retries ? ' · 재시도 ' + retries : ''}`;
+    $('xRes').textContent = txt;
+    log('★ 전송 결과: ' + txt);
+  } catch (e) { log('전송 실패: ' + errText(e)); $('xRes').textContent = '실패: ' + errText(e); }
+  $('xGo').disabled = false;
 };
 </script>
 </body>
